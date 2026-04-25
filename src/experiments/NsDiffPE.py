@@ -22,7 +22,7 @@ import torch.multiprocessing as mp
 from torch_timeseries.utils.parse_type import parse_type
 
 from torch_timeseries.utils.early_stop import EarlyStopping
-from src.layer.nsdiff_utils import q_sample, p_sample_loop, cal_sigma12, cal_sigma_tilde, cal_forward_noise
+from src.layer.nsdiff_utils import q_sample, p_sample_loop_pe, cal_sigma12, cal_sigma_tilde, cal_forward_noise
 import yaml
 import numpy as np
 import torch.distributed as dist
@@ -90,7 +90,7 @@ class NsDiffParameters:
     e_layers: int =  2
     d_layers: int =  1
     d_ff: int =  1024
-    diffusion_steps :int = 100 # 20
+    diffusion_steps :int = 20 # 20
     moving_avg: int =  25
     factor: int =  3
     distil: bool =  True
@@ -102,11 +102,10 @@ class NsDiffParameters:
     CART_input_x_embed_dim : int= 32
     p_hidden_layers : int = 2
     rolling_length : int = 96
-    load_pretrain : bool = False
 
 @dataclass
 class NsDiffForecast(ProbForecastExp, NsDiffParameters):
-    model_type: str = "NsDiff"
+    model_type: str = "NsDiffPE"
     def _init_model(self):
         self.label_len = self.windows // 2
         args_dict = {
@@ -156,14 +155,11 @@ class NsDiffForecast(ProbForecastExp, NsDiffParameters):
         self.cond_pred_model = ns_Transformer.Model(self.args).float().to(self.device)
         self.cond_pred_model_g = G.SigmaEstimation(self.windows, self.pred_len, self.dataset.num_features, 512, self.rolling_length).float().to(self.device)
         
-        if self.load_pretrain:
-            model_f_path = f"./results/runs/F/{self.dataset_type}/w{self.windows}h1s{self.pred_len}/1/best_model.pth"
-            model_g_path = f"./results/runs/G/{self.dataset_type}/w{self.windows}h1s{self.pred_len}/1/best_model.pth"
-            print("using pretrained model...")
-            print(f"f(x): {model_f_path}")
-            print(f"g(x): {model_g_path}")
-            self.cond_pred_model.load_state_dict(torch.load(model_f_path, map_location=self.device, weights_only=True))
-            self.cond_pred_model_g.load_state_dict(torch.load(model_g_path, map_location=self.device, weights_only=True))
+        
+        # model_f_path = f"./results/runs/F/{self.dataset_type}/w{self.windows}h1s{self.pred_len}/1/best_model.pth"
+        # model_g_path = f"./results/runs/G/{self.dataset_type}/w{self.windows}h1s{self.pred_len}/1/best_model.pth"
+        # self.cond_pred_model.load_state_dict(torch.load(model_f_path, map_location=self.device))
+        # self.cond_pred_model_g.load_state_dict(torch.load(model_g_path, map_location=self.device))
 
 
 
@@ -181,16 +177,16 @@ class NsDiffForecast(ProbForecastExp, NsDiffParameters):
 
 
 
-    # def _load_best_model(self):
-    #     self.model.load_state_dict(
-    #         torch.load(os.path.join(self.run_save_dir, 'model.pth'), map_location=self.device)
-    #     )
-    #     self.cond_pred_model.load_state_dict(
-    #         torch.load(os.path.join(self.run_save_dir, 'cond_pred_model.pth'), map_location=self.device)
-    #     )
-    #     self.cond_pred_model_g.load_state_dict(
-    #         torch.load(os.path.join(self.run_save_dir, 'cond_pred_model_g.pth'), map_location=self.device)
-    #     )
+    def _load_best_model(self):
+        self.model.load_state_dict(
+            torch.load(os.path.join(self.run_save_dir, 'model.pth'), map_location=self.device)
+        )
+        self.cond_pred_model.load_state_dict(
+            torch.load(os.path.join(self.run_save_dir, 'cond_pred_model.pth'), map_location=self.device)
+        )
+        self.cond_pred_model_g.load_state_dict(
+            torch.load(os.path.join(self.run_save_dir, 'cond_pred_model_g.pth'), map_location=self.device)
+        )
 
     def _setup_early_stopper(self):
         self.best_checkpoint_filepath = os.path.join(
@@ -257,7 +253,6 @@ class NsDiffForecast(ProbForecastExp, NsDiffParameters):
         self.model.train()
         self.cond_pred_model.train()
         self.cond_pred_model_g.train()
-
         with torch.enable_grad(), tqdm(total=len(self.train_loader.dataset)) as progress_bar:
             train_loss = []
             for i, (
@@ -313,8 +308,10 @@ class NsDiffForecast(ProbForecastExp, NsDiffParameters):
         # dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
         # dec_inp = torch.cat([batch_x[:, -self.label_len:, :], dec_inp], dim=1).float().to(self.device)
         # y_sigma = wv_sigma(batch_y, self.rolling_length) + EPS
-        y_sigma = wv_sigma_trailing(torch.concat([batch_x, batch_y], dim=1), self.rolling_length) 
-        y_sigma = y_sigma[:, -self.pred_len:, :] + EPS
+        # y_sigma = wv_sigma_trailing(torch.concat([batch_x, batch_y], dim=1), self.rolling_length) 
+        # y_sigma = y_sigma[:, -self.pred_len:, :] + EPS
+        
+        # y_sigma = torch.ones_like(y_sigma).to(self.device)
         
         batch_y_input = torch.concat([batch_x[:, -self.label_len:, :], batch_y], dim=1)
         batch_y_mark_input = torch.concat([batch_x_mark[:, -self.label_len:, :], batch_y_mark], dim=1)
@@ -334,8 +331,12 @@ class NsDiffForecast(ProbForecastExp, NsDiffParameters):
         t = torch.cat([t, self.model.num_timesteps - 1 - t], dim=0)[:n]
         y_0_hat_batch, _ = self.cond_pred_model(batch_x, batch_x_mark, dec_inp, batch_y_mark_input)
         gx = self.cond_pred_model_g(batch_x) + EPS # (B, O, N)
+        gx = torch.ones_like(gx).to(self.device)
         loss1 = (y_0_hat_batch - batch_y).square().mean()
-        loss2 = (torch.sqrt(gx)- torch.sqrt(y_sigma)).square().mean()
+        
+        
+        # loss2 = (torch.sqrt(gx)- torch.sqrt(y_sigma)).square().mean()
+        loss2 =( 0.5 * (2 * torch.pi * torch.log(gx) +  (y_0_hat_batch - batch_y).square() / gx)).mean()
         
         
         # loss_vae = log_normal(batch_y, y_0_hat_batch, torch.from_numpy(np.array(1)))
@@ -344,11 +345,15 @@ class NsDiffForecast(ProbForecastExp, NsDiffParameters):
         y_T_mean = y_0_hat_batch
         e = torch.randn_like(batch_y).to(self.device)
 
-        forward_noise = cal_forward_noise(self.model.betas_tilde, self.model.betas_bar, gx, y_sigma, t)
+
+        
+        
+        
+        forward_noise = cal_forward_noise(self.model.betas_tilde, self.model.betas_bar, gx, gx, t)
         noise = e * torch.sqrt(forward_noise)
         sigma_tilde = cal_sigma_tilde(self.model.alphas, self.model.alphas_cumprod, self.model.alphas_cumprod_sum, 
                                       self.model.alphas_cumprod_prev, self.model.alphas_cumprod_sum_prev, 
-                                      self.model.betas_tilde_m_1, self.model.betas_bar_m_1, gx, y_sigma, t)
+                                      self.model.betas_tilde_m_1, self.model.betas_bar_m_1, gx, gx, t)
 
         y_t_batch = q_sample(batch_y, y_T_mean, self.model.alphas_bar_sqrt,
                                 self.model.one_minus_alphas_bar_sqrt, t, noise=noise)
@@ -356,8 +361,19 @@ class NsDiffForecast(ProbForecastExp, NsDiffParameters):
         output, sigma_theta = self.model(batch_x, batch_x_mark, y_t_batch, y_0_hat_batch, gx, t)
         sigma_theta = sigma_theta + EPS
         
-        kl_loss = ((e -output)).square().mean() + (sigma_tilde/sigma_theta).mean() - torch.log(sigma_tilde/sigma_theta).mean()
-        loss = kl_loss + loss1 + loss2 
+
+        # forward_noise
+
+
+        # loss = (e[:, -self.args.pred_len:, :] - output[:, -self.args.pred_len:, :]).square().mean()
+        # kl_loss = ((e - output)/sigma_theta).square().mean() + (y_sigma/sigma_theta).mean() - torch.log(y_sigma/sigma_theta).mean()
+        # kl_loss = ((e - output)).square().mean() + (y_sigma/sigma_theta).mean() - torch.log(y_sigma/sigma_theta).mean()
+        # kl_loss = ((1/sigma_tilde)*(sigma_tilde.sqrt() * e - sigma_theta.sqrt()*output)).square().mean() + (sigma_tilde/sigma_theta).mean() - torch.log(sigma_tilde/sigma_theta).mean()
+        # kl_loss = ((1/sigma_theta)*(sigma_tilde.sqrt() * e - sigma_theta.sqrt()*output)).square().mean() + (sigma_tilde/sigma_theta).mean() - torch.log(sigma_tilde/sigma_theta).mean()
+        kl_loss = ((e -output)).square().mean() #+ (sigma_tilde/sigma_theta).mean() - torch.log(sigma_tilde/sigma_theta).mean()
+        loss = kl_loss + loss2 
+        # print(kl_loss.item(), loss1.item() , loss2.item())
+        # /sigma_theta
         return loss
 
 
@@ -412,9 +428,10 @@ class NsDiffForecast(ProbForecastExp, NsDiffParameters):
         
         y_0_hat_batch, _ = self.cond_pred_model(batch_x, batch_x_mark, dec_inp,batch_y_mark_input)
         gx = self.cond_pred_model_g(batch_x)
+        # gx = torch.ones_like(gx).to(self.device)
         
         preds = []
-        for i in range(self.num_samples //minisample):
+        for i in range(self.diffusion_config.testing.n_z_samples //minisample):
             repeat_n = int(minisample)
             y_0_hat_tile = y_0_hat_batch.repeat(repeat_n, 1, 1, 1)
             y_0_hat_tile = y_0_hat_tile.transpose(0, 1).flatten(0, 1).to(self.device)
@@ -430,8 +447,7 @@ class NsDiffForecast(ProbForecastExp, NsDiffParameters):
             gen_y_box = []
             for _ in range(self.diffusion_config.testing.n_z_samples_depart):
                 for _ in range(self.diffusion_config.testing.n_z_samples_depart):
-                    start = time.time()
-                    y_tile_seq = p_sample_loop(self.model, x_tile, x_mark_tile, y_0_hat_tile, gx_tile, y_T_mean_tile,
+                    y_tile_seq = p_sample_loop_pe(self.model, x_tile, x_mark_tile, y_0_hat_tile, gx_tile, y_T_mean_tile,
                                                 self.model.num_timesteps,
                                                 self.model.alphas, self.model.one_minus_alphas_bar_sqrt,
                                                 self.model.alphas_cumprod, self.model.alphas_cumprod_sum,
@@ -439,7 +455,6 @@ class NsDiffForecast(ProbForecastExp, NsDiffParameters):
                                                 self.model.betas_tilde, self.model.betas_bar,
                                                 self.model.betas_tilde_m_1, self.model.betas_bar_m_1,
                                                 )
-                    # print(f"loop t: {time.time() - start}")
                 gen_y = store_gen_y_at_step_t(config=self.model.args,
                                                 config_diff=self.diffusion_config,
                                                 idx=self.model.num_timesteps, y_tile_seq=y_tile_seq)
@@ -459,7 +474,7 @@ class NsDiffForecast(ProbForecastExp, NsDiffParameters):
         batch_y = batch_y[:, -self.pred_len:, f_dim:].to(self.device) # B, T, N
 
         outs = preds.permute(0, 2, 3, 1)
-        assert (outs.shape[1], outs.shape[2], outs.shape[3]) == (self.pred_len, self.dataset.num_features, self.num_samples)
+        assert (outs.shape[1], outs.shape[2], outs.shape[3]) == (self.pred_len, self.dataset.num_features, self.diffusion_config.testing.n_z_samples)
         return outs, batch_y
 
     def run(self, seed=42) -> Dict[str, float]:

@@ -7,7 +7,7 @@ import os
 import random
 import time
 from typing import Dict, List, Type, Union
-
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -156,12 +156,50 @@ class ProbForecastExp(ForecastExp):
         raise NotImplementedError()
 
 
+        #give a plot function to plot the predictions and the true values
+    def plot_preds(self, outputs, batch_y):
+        # outputs: B, O, N, S
+        num_batches = outputs.shape[0]
+        batch_indices = range(max(0, num_batches - 2), num_batches)  # last 2 batches
+        for i in batch_indices:
+            plt.figure(figsize=(8, 4))
+            # outputs[i]: (O, N, S)
+            outs_i = outputs[i]  # (S, O, N)
+            # Take first variable (N=0): (S, O)
+            preds_feat = outs_i[:, 0, :]  # (O, S)
+            preds_mean = preds_feat.mean(dim=-1)  # (O,)
+            preds_p10 = preds_feat.quantile(0.02, dim=-1)
+            preds_p90 = preds_feat.quantile(0.98, dim=-1)
+            plt.plot(range(self.pred_len), preds_mean.cpu().numpy(), label="Prediction Mean", color="b")
+            # PI is not shown in the
+            plt.fill_between(range(self.pred_len),
+                            preds_p10.cpu().numpy(),
+                            preds_p90.cpu().numpy(),
+                            color="b", alpha=0.5, label="96% PI")
+
+            # True values (if available)
+            if batch_y is not None and batch_y.shape[0] > i:
+                # batch_y: [B, O, N]
+                plt.plot(range(self.pred_len),
+                        batch_y[i, :, 0].cpu().numpy(),
+                        label="True", color="k", linestyle="dashed")
+            plt.title(f"Batch {i} - First Variable - Prediction and Interval")
+            plt.xlabel("Prediction Step")
+            plt.ylabel("Value")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.run_save_dir, f"batch_{i}.svg"))
 
 
-    def _evaluate(self, dataloader):
+    def _evaluate(self, dataloader, plot=True):
         self.model.eval()
         self.metrics.reset()
         results = []
+
+        preds_list = []
+        truths_list = []
+
+
         with torch.no_grad():
             with tqdm(total=len(dataloader.dataset)) as progress_bar:
                 for batch_x, batch_y, origin_x, origin_y, batch_x_date_enc, batch_y_date_enc in dataloader:
@@ -189,9 +227,17 @@ class ProbForecastExp(ForecastExp):
                     results.append(self.task_pool.apply_async(update_metrics, (preds.contiguous().cpu().detach(), truths.contiguous().cpu().detach(), self.metrics)))
                     
                     progress_bar.update(batch_x.shape[0])
+                    preds_list.append(preds.detach().cpu())
+                    truths_list.append(truths.detach().cpu())
 
             for result in results:
                 result.get()  # Ensure the metric update is finished
+
+        # Concatenate over all collected batches
+        all_preds = torch.cat(preds_list, dim=0) # B, 
+        all_truths = torch.cat(truths_list, dim=0)
+
+        if plot: self.plot_preds(all_preds, all_truths)
 
         result = {name: float(metric.compute()) for name, metric in self.metrics.items()}
         return result
@@ -201,8 +247,8 @@ class ProbForecastExp(ForecastExp):
         
         self._init_dataset()
         
-        embed = 'timeF'
-        timeenc = 0 if embed != 'timeF' else 1
+        # embed = 'timeF'
+        timeenc = 3 #if embed != 'timeF' else 1
         
         self.timeenc = timeenc
 
@@ -215,7 +261,7 @@ class ProbForecastExp(ForecastExp):
                     window=self.windows,
                     horizon=self.horizon,
                     steps=self.pred_len,
-                    freq='h',
+                    freq=self.dataset.freq,
                     time_index=False,
                     time_enc=timeenc,
                     shuffle_train=shuffle,
@@ -230,7 +276,7 @@ class ProbForecastExp(ForecastExp):
                     self.scaler,
                     window=self.windows,
                     horizon=self.horizon,
-                    freq='h',
+                    freq=self.dataset.freq,
                     time_index=False,
                     steps=self.pred_len,
                     shuffle_train=shuffle,
@@ -248,7 +294,7 @@ class ProbForecastExp(ForecastExp):
                 horizon=self.horizon,
                 steps=self.pred_len,
                 scale_in_train=True,
-                freq='h',
+                freq=self.dataset.freq,
                 time_index=False,
                 shuffle_train=shuffle,
                 batch_size=self.batch_size,
