@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import os
 import time
 from types import SimpleNamespace
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -78,7 +78,7 @@ class RDITParameters:
     pos: bool = True
 
     # Residual diffusion config
-    sigma_mode: str = "ones"  # x_std | ones
+    sigma_mode: str = "res"  # x_std | ones | res (sqrt EMA of (y-f(x))^2 per feature)
 
 
 @dataclass
@@ -150,6 +150,8 @@ class RDITForecast(ProbForecastExp, RDITParameters):
         self.model = DiffPTS(self.args, self.device).to(self.device)
         self.cond_pred_model = TimeFilter(self.args).float().to(self.device)
         self.masks = self._get_mask()
+        # EMA of per-feature mean squared training residual (y - f(x))^2; used when sigma_mode == "res"
+        self._res_var_ema: Optional[torch.Tensor] = None
 
     def _init_optimizer(self):
         self.model_optim = parse_type(self.optm_type, globals=globals())(
@@ -173,6 +175,7 @@ class RDITForecast(ProbForecastExp, RDITParameters):
             "optimizer": self.model_optim.state_dict(),
             "rng_state": torch.get_rng_state(),
             "early_stopping": self.early_stopper.get_state(),
+            "res_var_ema": self._res_var_ema,
         }
         torch.save(self.run_state, f"{self.run_checkpoint_filepath}")
 
@@ -183,15 +186,25 @@ class RDITForecast(ProbForecastExp, RDITParameters):
         self.model_optim.load_state_dict(check_point["optimizer"])
         self.current_epoch = check_point["current_epoch"]
         self.early_stopper.set_state(check_point["early_stopping"])
+        if "res_var_ema" in check_point:
+            rve = check_point["res_var_ema"]
+            self._res_var_ema = None if rve is None else rve.to(self.device)
 
     def _load_best_model(self):
         self.model.load_state_dict(torch.load(self.best_checkpoint_filepath, map_location=self.device))
         self.cond_pred_model.load_state_dict(torch.load(self.best_cond_checkpoint_filepath, map_location=self.device))
 
     def _sigma(self, batch_x):
+        b, n = batch_x.size(0), self.dataset.num_features
         if self.sigma_mode == "ones":
-            return torch.ones(batch_x.size(0), 1, self.dataset.num_features, device=self.device)
-        # default: per-sample std from history x
+            return torch.ones(b, 1, n, device=self.device)
+        if self.sigma_mode == "res":
+            ve = getattr(self, "_res_var_ema", None)
+            if ve is None:
+                return torch.ones(b, 1, n, device=self.device)
+            s = torch.sqrt(ve.to(self.device) + EPS)
+            return s.expand(b, -1, -1)
+        # x_std: per-sample std from history x
         return batch_x.std(dim=1, keepdim=True, unbiased=False) + EPS
 
     def _train(self):
@@ -238,6 +251,16 @@ class RDITForecast(ProbForecastExp, RDITParameters):
 
         # additional point loss to train f(x) toward y
         fx_loss = (fx - batch_y).square().mean()
+
+        if self.sigma_mode == "res":
+            with torch.no_grad():
+                r = batch_y - fx.detach()
+                vb = r.pow(2).mean(dim=(0, 1), keepdim=True)
+                if self._res_var_ema is None:
+                    self._res_var_ema = vb.clone()
+                else:
+                    m = 0.05 #self.res_sigma_ema_momentum #  
+                    self._res_var_ema.mul_(1 - m).add_(vb, alpha=m)
 
         sigma = self._sigma(batch_x)  # [B,1,N]
         res0 = (batch_y - fx) / sigma
