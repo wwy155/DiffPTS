@@ -113,7 +113,7 @@ class D3UParameters:
 
 @dataclass
 class D3UForecast(ProbForecastExp, D3UParameters):
-    model_type: str = "D3U"
+    model_type: str = "D3U1"
     def _init_model(self):
         self.label_len = self.windows // 2
         args_dict = {
@@ -359,7 +359,7 @@ class D3UForecast(ProbForecastExp, D3UParameters):
         self.model.set_enc_out(enc_out)
         output, _ = self.model(batch_x, batch_x_mark, y_t_batch, fx, gx, t)
 
-        kl_loss = ((e - output)).square().mean()
+        kl_loss = ((e - output)).square().mean() + (y_res**2).mean()
         return kl_loss
 
 

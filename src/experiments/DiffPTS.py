@@ -35,6 +35,9 @@ from src.utils.sigma import wv_sigma, wv_sigma_trailing
 from torch_timeseries.nn.embedding import freq_map
 
 
+from src.nn.iTransformerBackbone import iTransformerEnc
+from src.nn.PatchTSTBackbone import PatchTSTEnc
+
 
 def dict2namespace(config):
     namespace = argparse.Namespace()
@@ -110,6 +113,34 @@ class DiffPTSParameters:
     # time_enc : int = 3
     # revin : bool = True
     # backbone : str  = 'linear'
+    # Conditional predictor backbone (f(x))
+    # - "ns_transformer": original mu_backbone.Model
+    # - "itransformer": src/nn/iTransformerBackbone.py (encoder-only)
+    # - "patchtst": src/nn/PatchTSTBackbone.py (encoder-only)
+    cond_backbone: str = "ns_transformer"
+    # patchtst_patch_len: int = 16
+    # patchtst_stride: int = 8
+
+
+class _EncOnlyCondWrapper(torch.nn.Module):
+    """
+    Adapter to make encoder-only backbones compatible with DiffPTS' cond_pred_model API:
+    forward(x_enc, x_mark_enc, x_dec, x_mark_dec) -> (pred, aux)
+    """
+
+    def __init__(self, enc: torch.nn.Module, pred_len: int, num_features: int):
+        super().__init__()
+        self.enc = enc
+        self.pred_len = pred_len
+        self.num_features = num_features
+
+    def forward(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None, *args, **kwargs):
+        # DiffPTS passes x_enc as [B, T, N]
+        b = x_enc.size(0)
+        # enc returns [B*N, pred_len]
+        out = self.enc(x_enc)
+        pred = out.reshape(b, self.num_features, self.pred_len).permute(0, 2, 1).contiguous()
+        return pred, pred
 
 @dataclass
 class DiffPTSForecast(ProbForecastExp, DiffPTSParameters):
@@ -162,10 +193,52 @@ class DiffPTSForecast(ProbForecastExp, DiffPTSParameters):
         self.args = SimpleNamespace(**args_dict)
         
         self.model = DiffPTS(self.args, self.device).to(self.device)
-        # if self.backbone == 'linear':
-        #     self.cond_pred_model = LinearBackbone.Model(self.args).float().to(self.device)
-        # else:
-        self.cond_pred_model = ns_Transformer.Model(self.args).float().to(self.device)
+        if self.cond_backbone == "itransformer":
+            enc = iTransformerEnc(
+                seq_len=self.windows,
+                pred_len=self.pred_len,
+                enc_in=self.dataset.num_features,
+                factor=self.factor,
+                n_heads=self.n_heads,
+                d_ff=self.d_ff,
+                activation=self.activation,
+                e_layers=self.e_layers,
+                d_model=self.d_model,
+                dropout=self.dropout,
+            ).float().to(self.device)
+            self.cond_pred_model = _EncOnlyCondWrapper(enc, self.pred_len, self.dataset.num_features).to(self.device)
+        elif self.cond_backbone == "patchtst":
+            # PatchTSTEnc expects x_enc as [B, N, T]
+            class _PatchTSTAdapter(torch.nn.Module):
+                def __init__(self, inner: torch.nn.Module, pred_len: int, num_features: int):
+                    super().__init__()
+                    self.inner = inner
+                    self.pred_len = pred_len
+                    self.num_features = num_features
+
+                def forward(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None, *args, **kwargs):
+                    b = x_enc.size(0)
+                    out = self.inner(x_enc.transpose(1, 2).contiguous())
+                    pred = out.reshape(b, self.num_features, self.pred_len).permute(0, 2, 1).contiguous()
+                    return pred, pred
+
+            enc = PatchTSTEnc(
+                seq_len=self.windows,
+                pred_len=self.pred_len,
+                enc_in=self.dataset.num_features,
+                patch_len=16,
+                stride=8,
+                n_heads=self.n_heads,
+                d_ff=self.d_ff,
+                activation=self.activation,
+                e_layers=self.e_layers,
+                d_model=self.d_model,
+                dropout=self.dropout,
+            ).float().to(self.device)
+            self.cond_pred_model = _PatchTSTAdapter(enc, self.pred_len, self.dataset.num_features).to(self.device)
+        else:
+            # default (original)
+            self.cond_pred_model = ns_Transformer.Model(self.args).float().to(self.device)
         self.cond_pred_model_g = G.SigmaEstimation(self.windows, self.pred_len, self.dataset.num_features, 512).float().to(self.device)
         
         

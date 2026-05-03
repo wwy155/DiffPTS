@@ -211,8 +211,8 @@ def p_sample_t_1to0(model, x, x_mark, y, y_0_hat, gx, y_T_mean, one_minus_alphas
     t = torch.tensor([0]).to(device)  # corresponding to timestep 1 (i.e., t=1 in diffusion models)
     sqrt_one_minus_alpha_bar_t = extract(one_minus_alphas_bar_sqrt, t, y)
     sqrt_alpha_bar_t = (1 - sqrt_one_minus_alpha_bar_t.square()).sqrt()
-    eps_theta, _ = model(x, x_mark, y, y_0_hat, gx, t)
-    sigma_theta = betas_tiled*gx
+    eps_theta, sigma_theta = model(x, x_mark, y, y_0_hat, gx, t)
+    
     # at_tilde = extract(alphas_cumprod_sum, t, gx)
     
     eps_theta = eps_theta.to(device).detach()
@@ -237,7 +237,6 @@ def p_sample_t_1to0(model, x, x_mark, y, y_0_hat, gx, y_T_mean, one_minus_alphas
             y - (1 - sqrt_alpha_bar_t) * y_T_mean - eps_theta * torch.sqrt(noise))
     y_t_m_1 = y_0_reparam.to(device)
     return y_t_m_1
-
 
 def p_sample_t_1to0_pe(model, x, x_mark, y, y_0_hat, gx, y_T_mean, one_minus_alphas_bar_sqrt,alphas,alphas_cumprod,alphas_cumprod_sum,alpha_bar_prev, alphas_cumprod_sum_prev,betas_tiled_all, betas_bar_all, betas_tiled_m_1_all, betas_bar_m_1_all):
     device = next(model.parameters()).device
