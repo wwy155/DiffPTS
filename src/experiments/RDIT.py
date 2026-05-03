@@ -18,6 +18,7 @@ from torch_timeseries.utils.parse_type import parse_type
 from torch_timeseries.utils.reproduce import reproducible
 
 from src.experiments.prob_forecast import ProbForecastExp
+import src.layer.g_backbone as G
 from src.layer.diffpts_utils import q_sample, p_sample_loop, cal_forward_noise
 from src.models.DiffPTS import DiffPTS
 from src.rdit.model.TimeFilter import Model as TimeFilter
@@ -47,6 +48,11 @@ class RDITEarlyStopping(EarlyStopping):
             )
         torch.save(model["model"].state_dict(), os.path.join(self.path, "model.pth"))
         torch.save(model["cond_pred_model"].state_dict(), os.path.join(self.path, "cond_pred_model.pth"))
+        if model.get("cond_pred_model_g") is not None:
+            torch.save(
+                model["cond_pred_model_g"].state_dict(),
+                os.path.join(self.path, "cond_pred_model_g.pth"),
+            )
         self.val_loss_min = val_loss
 
 
@@ -78,7 +84,8 @@ class RDITParameters:
     pos: bool = True
 
     # Residual diffusion config
-    sigma_mode: str = "res"  # x_std | ones | res (sqrt EMA of (y-f(x))^2 per feature)
+    # x_std | ones | res (sqrt EMA of (y-f(x))^2 per feature) | nll (learn gx via SigmaEstimation + NLL, sigma at inference is gx)
+    sigma_mode: str = "nll"
 
 
 @dataclass
@@ -149,19 +156,29 @@ class RDITForecast(ProbForecastExp, RDITParameters):
         self.args = SimpleNamespace(**args_dict)
         self.model = DiffPTS(self.args, self.device).to(self.device)
         self.cond_pred_model = TimeFilter(self.args).float().to(self.device)
+        if self.sigma_mode == "nll":
+            self.cond_pred_model_g = G.SigmaEstimation(
+                self.windows, self.pred_len, self.dataset.num_features, 512
+            ).float().to(self.device)
+        else:
+            self.cond_pred_model_g = None
         self.masks = self._get_mask()
         # EMA of per-feature mean squared training residual (y - f(x))^2; used when sigma_mode == "res"
         self._res_var_ema: Optional[torch.Tensor] = None
 
     def _init_optimizer(self):
+        param_groups = [{"params": self.model.parameters()}, {"params": self.cond_pred_model.parameters()}]
+        if self.cond_pred_model_g is not None:
+            param_groups.append({"params": self.cond_pred_model_g.parameters()})
         self.model_optim = parse_type(self.optm_type, globals=globals())(
-            [{"params": self.model.parameters()}, {"params": self.cond_pred_model.parameters()}],
+            param_groups,
             lr=self.lr,
         )
 
     def _setup_early_stopper(self):
         self.best_checkpoint_filepath = os.path.join(self.run_save_dir, "model.pth")
         self.best_cond_checkpoint_filepath = os.path.join(self.run_save_dir, "cond_pred_model.pth")
+        self.best_cond_g_checkpoint_filepath = os.path.join(self.run_save_dir, "cond_pred_model_g.pth")
         self.early_stopper = RDITEarlyStopping(self.patience, verbose=True, path=self.run_save_dir)
 
     def _save_run_check_point(self, seed):
@@ -177,12 +194,16 @@ class RDITForecast(ProbForecastExp, RDITParameters):
             "early_stopping": self.early_stopper.get_state(),
             "res_var_ema": self._res_var_ema,
         }
+        if self.cond_pred_model_g is not None:
+            self.run_state["cond_pred_model_g"] = self.cond_pred_model_g.state_dict()
         torch.save(self.run_state, f"{self.run_checkpoint_filepath}")
 
     def _resume_run(self, seed):
         check_point = torch.load(self.run_checkpoint_filepath, map_location=self.device)
         self.model.load_state_dict(check_point["model"])
         self.cond_pred_model.load_state_dict(check_point["cond_pred_model"])
+        if self.cond_pred_model_g is not None and check_point.get("cond_pred_model_g") is not None:
+            self.cond_pred_model_g.load_state_dict(check_point["cond_pred_model_g"])
         self.model_optim.load_state_dict(check_point["optimizer"])
         self.current_epoch = check_point["current_epoch"]
         self.early_stopper.set_state(check_point["early_stopping"])
@@ -193,9 +214,16 @@ class RDITForecast(ProbForecastExp, RDITParameters):
     def _load_best_model(self):
         self.model.load_state_dict(torch.load(self.best_checkpoint_filepath, map_location=self.device))
         self.cond_pred_model.load_state_dict(torch.load(self.best_cond_checkpoint_filepath, map_location=self.device))
+        if self.cond_pred_model_g is not None and os.path.isfile(self.best_cond_g_checkpoint_filepath):
+            self.cond_pred_model_g.load_state_dict(
+                torch.load(self.best_cond_g_checkpoint_filepath, map_location=self.device)
+            )
 
     def _sigma(self, batch_x):
         b, n = batch_x.size(0), self.dataset.num_features
+        if self.sigma_mode == "nll":
+            assert self.cond_pred_model_g is not None
+            return self.cond_pred_model_g(batch_x)
         if self.sigma_mode == "ones":
             return torch.ones(b, 1, n, device=self.device)
         if self.sigma_mode == "res":
@@ -210,6 +238,8 @@ class RDITForecast(ProbForecastExp, RDITParameters):
     def _train(self):
         self.model.train()
         self.cond_pred_model.train()
+        if self.cond_pred_model_g is not None:
+            self.cond_pred_model_g.train()
         with torch.enable_grad(), tqdm(total=len(self.train_loader.dataset)) as progress_bar:
             train_loss = []
             for batch_x, batch_y, _, origin_y, batch_x_mark, batch_y_mark in self.train_loader:
@@ -234,6 +264,8 @@ class RDITForecast(ProbForecastExp, RDITParameters):
 
         self.model.eval()
         self.cond_pred_model.eval()
+        if self.cond_pred_model_g is not None:
+            self.cond_pred_model_g.eval()
         return train_loss
 
     def _process_train_batch(self, batch_x, batch_y, batch_x_mark, batch_y_mark):
@@ -252,20 +284,28 @@ class RDITForecast(ProbForecastExp, RDITParameters):
         # additional point loss to train f(x) toward y
         fx_loss = (fx - batch_y).square().mean()
 
-        if self.sigma_mode == "res":
-            with torch.no_grad():
-                r = batch_y - fx.detach()
-                vb = r.pow(2).mean(dim=(0, 1), keepdim=True)
-                if self._res_var_ema is None:
-                    self._res_var_ema = vb.clone()
-                else:
-                    m = 0.05 #self.res_sigma_ema_momentum #  
-                    self._res_var_ema.mul_(1 - m).add_(vb, alpha=m)
+        nll_loss = batch_x.new_zeros(())
 
-        sigma = self._sigma(batch_x)  # [B,1,N]
-        res0 = (batch_y - fx) / sigma
+        if self.sigma_mode == "nll":
+            gx = self.cond_pred_model_g(batch_x)
+            gv = gx.clamp(min=EPS)
+            nll_loss = 0.5 * (torch.log(gv) + (fx - batch_y).square() / gv).mean()
+            sigma_scale = gv
+        else:
+            gx = torch.ones_like(batch_y).to(self.device)
+            if self.sigma_mode == "res":
+                with torch.no_grad():
+                    r = batch_y - fx.detach()
+                    vb = r.pow(2).mean(dim=(0, 1), keepdim=True)
+                    if self._res_var_ema is None:
+                        self._res_var_ema = vb.clone()
+                    else:
+                        m = 0.05 #self.res_sigma_ema_momentum #
+                        self._res_var_ema.mul_(1 - m).add_(vb, alpha=m)
+            sigma_scale = self._sigma(batch_x)  # [B,1,N] for non-nll modes
 
-        gx = torch.ones_like(batch_y).to(self.device)
+        res0 = (batch_y - fx) / sigma_scale
+
         e = torch.randn_like(res0).to(self.device)
         forward_noise = cal_forward_noise(self.model.betas_bar, gx, t)
         noise = e * torch.sqrt(forward_noise)
@@ -273,7 +313,7 @@ class RDITForecast(ProbForecastExp, RDITParameters):
         res_t = q_sample(res0, torch.zeros_like(res0), self.model.alphas_bar_sqrt, self.model.one_minus_alphas_bar_sqrt, t, noise=noise)
         output, _ = self.model(batch_x, batch_x_mark, res_t, fx, gx, t)
         diff_loss = ((e - output)).square().mean()
-        loss = diff_loss +  fx_loss
+        loss = diff_loss + fx_loss + nll_loss
         return loss
 
     def _process_val_batch(self, batch_x, batch_y, batch_x_mark, batch_y_mark, plot=True):
@@ -301,9 +341,12 @@ class RDITForecast(ProbForecastExp, RDITParameters):
         # point estimate f(x)
         fx, _ = self.cond_pred_model(batch_x, self.masks, is_training=False)
         fx = fx[:, -self.pred_len :, :]
-        sigma = self._sigma(batch_x)  # [B,1,N]
-
-        gx = torch.ones_like(batch_y).to(self.device)
+        if self.sigma_mode == "nll":
+            gx = self.cond_pred_model_g(batch_x)
+            sigma = gx  # residual decode scaling matches learned variance (same as DiffPTS gx)
+        else:
+            gx = torch.ones_like(batch_y).to(self.device)
+            sigma = self._sigma(batch_x)  # [B,1,N]
 
         preds = []
         for _ in range(self.diffusion_config.testing.n_z_samples // minisample):
@@ -395,7 +438,10 @@ class RDITForecast(ProbForecastExp, RDITParameters):
             _ = self._test()
 
             self.current_epoch = self.current_epoch + 1
-            self.early_stopper(val_result["crps"], model={"model": self.model, "cond_pred_model": self.cond_pred_model})
+            stop_model = {"model": self.model, "cond_pred_model": self.cond_pred_model}
+            if self.cond_pred_model_g is not None:
+                stop_model["cond_pred_model_g"] = self.cond_pred_model_g
+            self.early_stopper(val_result["crps"], model=stop_model)
             self._save_run_check_point(seed)
 
             if self._use_wandb():

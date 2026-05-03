@@ -38,8 +38,6 @@ class SigmaEstimation(nn.Module):
             nn.Linear(hidden_size, pred_len)  # Output size should match enc_in
         )
         
-
-        
     def forward(self, x_enc):
         # x_enc: B, T, N
         # return sigmas: B, O, N
