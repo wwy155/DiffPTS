@@ -117,7 +117,7 @@ class DiffPTSParameters:
     # - "ns_transformer": original mu_backbone.Model
     # - "itransformer": src/nn/iTransformerBackbone.py (encoder-only)
     # - "patchtst": src/nn/PatchTSTBackbone.py (encoder-only)
-    cond_backbone: str = "ns_transformer"
+    cond_backbone: str = "patchtst"
     # patchtst_patch_len: int = 16
     # patchtst_stride: int = 8
 
