@@ -7,5 +7,4 @@ python3 ./src/experiments/DiffPTS.py \
    --horizon=1 \
    --pred_len=192 \
    --windows=168 \
-   config_wandb ProbForecastBase \
    runs --seeds='[1, 2, 3]'
