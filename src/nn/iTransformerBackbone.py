@@ -31,15 +31,16 @@ class iTransformerEnc(nn.Module):
 
 
     def forward(self, x_enc):
-        x_enc = x_enc.permute(0, 2, 1)
-        B, _, N = x_enc.shape # B L N
+        # Expect input x_enc as [B, L, N] (L=seq_len).
+        # DataEmbedding_inverted performs the required inversion internally.
+        B, _, N = x_enc.shape  # B L N
         # B: batch_size;    E: d_model; 
         # L: seq_len;       S: pred_len;
         # N: number of variate (tokens), can also includes covariates
         
         # Embedding
         # B L N -> B N E                (B L N -> B L E in the vanilla Transformer)
-        enc_out = self.enc_embedding(x_enc, None) # covariates (e.g timestamp) can be also embedded as tokens
+        enc_out = self.enc_embedding(x_enc, None)  # covariates can be embedded as tokens
         
         # B N E -> B N E                (B L E -> B L E in the vanilla Transformer)
         # the dimensions of embedded time series has been inverted, and then processed by native attn, layernorm and ffn modules
